@@ -6,6 +6,7 @@ Supports both raw audio loading and preprocessed tensor loading.
 """
 
 import os
+import sys
 import json
 import random
 from typing import Optional, List, Dict, Any, Tuple
@@ -14,6 +15,19 @@ from loguru import logger
 import torch
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
+
+# --- WINDOWS STABILITY PATCH ---
+# On Windows, PyTorch Lightning/Fabric often hangs when attempting DDP (Distributed Data Parallel).
+# We force single-device mode variables here to prevent these hangs globally.
+if sys.platform == 'win32':
+    os.environ["PL_TRAINER_DEVICES"] = "1"
+    os.environ["PL_TRAINER_NUM_NODES"] = "1"
+    os.environ["PL_TRAINER_STRATEGY"] = "auto"
+    # Fallback for network initialization to prevent timeouts
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = "29500"
+# -------------------------------
 
 try:
     from lightning.pytorch import LightningDataModule
@@ -191,7 +205,15 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         
         self.tensor_dir = tensor_dir
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        
+        # Windows Check: Force workers to 0 to prevent hangs
+        if sys.platform == 'win32':
+            if num_workers > 0:
+                logger.debug(f"Windows detected: Forcing num_workers=0 (was {num_workers})")
+            self.num_workers = 0
+        else:
+            self.num_workers = num_workers
+
         self.pin_memory = pin_memory
         self.val_split = val_split
         
@@ -223,6 +245,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            persistent_workers=(self.num_workers > 0),
             pin_memory=self.pin_memory,
             collate_fn=collate_preprocessed_batch,
             drop_last=True,
@@ -238,6 +261,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            persistent_workers=(self.num_workers > 0),
             pin_memory=self.pin_memory,
             collate_fn=collate_preprocessed_batch,
         )
@@ -384,7 +408,7 @@ class AceStepDataModule(LightningDataModule if LIGHTNING_AVAILABLE else object):
         samples: List[Dict[str, Any]],
         dit_handler,
         batch_size: int = 1,
-        num_workers: int = 4,
+        num_workers: int = 0,
         pin_memory: bool = True,
         max_duration: float = 240.0,
         val_split: float = 0.0,
@@ -395,7 +419,13 @@ class AceStepDataModule(LightningDataModule if LIGHTNING_AVAILABLE else object):
         self.samples = samples
         self.dit_handler = dit_handler
         self.batch_size = batch_size
-        self.num_workers = num_workers
+        
+        # Windows Check: Force workers to 0
+        if sys.platform == 'win32':
+            self.num_workers = 0
+        else:
+            self.num_workers = num_workers
+
         self.pin_memory = pin_memory
         self.max_duration = max_duration
         self.val_split = val_split
