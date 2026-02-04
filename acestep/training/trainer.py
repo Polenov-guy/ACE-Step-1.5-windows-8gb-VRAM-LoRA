@@ -6,6 +6,8 @@ Supports training from preprocessed tensor files for optimal performance.
 """
 
 import os
+import sys
+import gc
 import time
 from typing import Optional, List, Dict, Any, Tuple, Generator
 from loguru import logger
@@ -37,6 +39,18 @@ from acestep.training.data_module import PreprocessedDataModule
 
 # Turbo model shift=3.0 discrete timesteps (8 steps, same as inference)
 TURBO_SHIFT3_TIMESTEPS = [1.0, 0.9545454545454546, 0.9, 0.8333333333333334, 0.75, 0.6428571428571429, 0.5, 0.3]
+
+
+def is_low_vram_mode() -> bool:
+    """Check if the GPU has limited VRAM (<12GB) to enable aggressive optimizations."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+        # Threshold: 12GB. If less, we use BFloat16 + Checkpointing + Aggressive GC
+        return total_mem < (12 * 1024**3)
+    except:
+        return False
 
 
 def sample_discrete_timestep(bsz, device, dtype):
@@ -119,24 +133,12 @@ class PreprocessedLoRAModule(nn.Module):
         self.training_losses = []
     
     def training_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Single training step using preprocessed tensors.
+        """Single training step using preprocessed tensors."""
+        # Ensure BFloat16 is used for autocast if available (critical for Low VRAM)
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         
-        Note: This is a distilled turbo model, NO CFG is used.
-        
-        Args:
-            batch: Dictionary containing pre-computed tensors:
-                - target_latents: [B, T, 64] - VAE encoded audio
-                - attention_mask: [B, T] - Valid audio mask
-                - encoder_hidden_states: [B, L, D] - Condition encoder output
-                - encoder_attention_mask: [B, L] - Condition mask
-                - context_latents: [B, T, 128] - Source context
-            
-        Returns:
-            Loss tensor (float32 for stable backward)
-        """
-        # Use autocast for bf16 mixed precision training
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            # Get tensors from batch (already on device from Fabric dataloader)
+        with torch.autocast(device_type='cuda', dtype=dtype):
+            # Get tensors from batch
             target_latents = batch["target_latents"].to(self.device)  # x0
             attention_mask = batch["attention_mask"].to(self.device)
             encoder_hidden_states = batch["encoder_hidden_states"].to(self.device)
@@ -150,13 +152,17 @@ class PreprocessedLoRAModule(nn.Module):
             x0 = target_latents  # Data
             
             # Sample timesteps from discrete turbo shift=3 schedule (8 steps)
-            t, r = sample_discrete_timestep(bsz, self.device, torch.bfloat16)
+            t, r = sample_discrete_timestep(bsz, self.device, dtype)
             t_ = t.unsqueeze(-1).unsqueeze(-1)
             
             # Interpolate: x_t = t * x1 + (1 - t) * x0
             xt = t_ * x1 + (1.0 - t_) * x0
             
-            # Forward through decoder (distilled turbo model, no CFG)
+            # [CRITICAL FIX] Enable gradients for input to support Gradient Checkpointing
+            # Without this, loss.backward() fails when checkpointing is enabled.
+            xt.requires_grad_(True)
+            
+            # Forward through decoder
             decoder_outputs = self.model.decoder(
                 hidden_states=xt,
                 timestep=t,
@@ -173,7 +179,6 @@ class PreprocessedLoRAModule(nn.Module):
         
         # Convert loss to float32 for stable backward pass
         diffusion_loss = diffusion_loss.float()
-        
         self.training_losses.append(diffusion_loss.item())
         
         return diffusion_loss
@@ -213,22 +218,10 @@ class LoRATrainer:
         training_state: Optional[Dict] = None,
         resume_from: Optional[str] = None,
     ) -> Generator[Tuple[int, float, str], None, None]:
-        """Train LoRA adapters from preprocessed tensor files.
-
-        This is the recommended training method for best performance.
-
-        Args:
-            tensor_dir: Directory containing preprocessed .pt files
-            training_state: Optional state dict for stopping control
-            resume_from: Optional path to checkpoint directory to resume from
-
-        Yields:
-            Tuples of (step, loss, status_message)
-        """
+        """Train LoRA adapters from preprocessed tensor files."""
         self.is_training = True
         
         try:
-            # Validate tensor directory
             if not os.path.exists(tensor_dir):
                 yield 0, 0.0, f"❌ Tensor directory not found: {tensor_dir}"
                 return
@@ -250,7 +243,6 @@ class LoRATrainer:
                 pin_memory=self.training_config.pin_memory,
             )
             
-            # Setup data
             data_module.setup('fit')
             
             if len(data_module.train_dataset) == 0:
@@ -259,9 +251,14 @@ class LoRATrainer:
             
             yield 0, 0.0, f"📂 Loaded {len(data_module.train_dataset)} preprocessed samples"
 
-            if LIGHTNING_AVAILABLE:
+            # Determine training backend
+            # On Windows, Fabric/DDP often causes timeouts. We fallback to Basic Loop.
+            use_fabric = LIGHTNING_AVAILABLE and sys.platform != 'win32'
+
+            if use_fabric:
                 yield from self._train_with_fabric(data_module, training_state, resume_from)
             else:
+                logger.info(f"Using Basic Training Loop (System: {sys.platform})")
                 yield from self._train_basic(data_module, training_state)
                 
         except Exception as e:
@@ -495,13 +492,42 @@ class LoRATrainer:
         data_module: PreprocessedDataModule,
         training_state: Optional[Dict],
     ) -> Generator[Tuple[int, float, str], None, None]:
-        """Basic training loop without Fabric."""
+        """Basic training loop without Fabric.
+        
+        Includes automatic optimization for Low VRAM (<12GB) GPUs:
+        - BFloat16 loading
+        - Gradient Checkpointing
+        - Aggressive Garbage Collection
+        """
         yield 0, 0.0, "🚀 Starting basic training loop..."
         
         os.makedirs(self.training_config.output_dir, exist_ok=True)
-        
         train_loader = data_module.train_dataloader()
         
+        # 1. Device & Memory Setup
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Detect Low VRAM environment
+        low_vram = is_low_vram_mode()
+        target_dtype = torch.bfloat16 if (low_vram and torch.cuda.is_bf16_supported()) else torch.float32
+
+        if low_vram:
+            logger.info("Low VRAM detected: Enabling BFloat16, Gradient Checkpointing, and Aggressive GC.")
+            torch.cuda.empty_cache()
+
+        # Move model to device
+        self.module.model.to(device, dtype=target_dtype)
+        self.module.device = device
+        
+        # 2. Enable Gradient Checkpointing (Critical for 8GB Cards)
+        if low_vram:
+            if hasattr(self.module.model.decoder, "gradient_checkpointing"):
+                self.module.model.decoder.gradient_checkpointing = True
+            try:
+                self.module.model.decoder.gradient_checkpointing_enable()
+            except:
+                pass
+
         trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
         
         if not trainable_params:
@@ -532,14 +558,22 @@ class LoRATrainer:
             num_batches = 0
             epoch_start_time = time.time()
             
-            for batch in train_loader:
+            for i, batch in enumerate(train_loader):
                 if training_state and training_state.get("should_stop", False):
                     yield global_step, accumulated_loss / max(accumulation_step, 1), "⏹️ Training stopped"
                     return
                 
+                # 3. Aggressive Memory Cleanup (Prevents Swapping on Windows)
+                if low_vram:
+                    # Clear cache every few steps to prevent OOM/Swapping
+                    if i % 5 == 0: 
+                        torch.cuda.empty_cache()
+                        gc.collect()
+
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
                 loss.backward()
+                
                 accumulated_loss += loss.item()
                 accumulation_step += 1
                 
@@ -561,7 +595,7 @@ class LoRATrainer:
             
             epoch_time = time.time() - epoch_start_time
             avg_epoch_loss = epoch_loss / max(num_batches, 1)
-            yield global_step, avg_epoch_loss, f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s"
+            yield global_step, avg_epoch_loss, f"✅ Epoch {epoch+1}/{self.training_config.max_epochs} in {epoch_time:.1f}s, Loss: {avg_epoch_loss:.4f}"
             
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
@@ -572,7 +606,7 @@ class LoRATrainer:
         save_lora_weights(self.module.model, final_path)
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
         yield global_step, final_loss, f"✅ Training complete! LoRA saved to {final_path}"
-    
+
     def stop(self):
         """Stop training."""
         self.is_training = False
